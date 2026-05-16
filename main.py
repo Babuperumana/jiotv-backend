@@ -1,0 +1,836 @@
+import asyncio
+import asyncio.selector_events
+import base64
+import json
+import os
+import random
+import re
+import time
+from contextlib import asynccontextmanager
+from uuid import uuid4
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# Python 3.13 asyncio bug workaround (Windows only)
+# _SelectorSocketTransport._write_send() asserts buffer is non-empty,
+# but Starlette/uvicorn can schedule writes after buffer is already drained.
+# Monkey-patch to silently return instead of crashing.
+# ---------------------------------------------------------------------------
+if hasattr(asyncio, "selector_events") and hasattr(asyncio.selector_events, "_SelectorSocketTransport"):
+    _orig_write_send = asyncio.selector_events._SelectorSocketTransport._write_send
+
+    def _patched_write_send(self):
+        if not self._buffer:
+            return
+        _orig_write_send(self)
+
+    asyncio.selector_events._SelectorSocketTransport._write_send = _patched_write_send
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client (connection pooling — eliminates per-request TCP/TLS churn)
+# ---------------------------------------------------------------------------
+_http_client: httpx.AsyncClient | None = None
+_token_lock = asyncio.Lock()
+
+# Token refresh interval: re-fetch CDN token every 90 seconds proactively
+TOKEN_MAX_AGE = 90
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        verify=False,
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=30),
+    )
+    yield
+    await _http_client.aclose()
+    _http_client = None
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Session persistence (single-user POC)
+# ---------------------------------------------------------------------------
+SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.json")
+SESSION: dict = {}
+
+
+def _save_session():
+    with open(SESSION_FILE, "w") as f:
+        json.dump(SESSION, f)
+
+
+def _load_session():
+    global SESSION
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, "r") as f:
+                SESSION = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            SESSION = {}
+
+
+# Load on startup
+_load_session()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+OTP_HEADERS = {
+    "user-agent": "okhttp/4.2.2",
+    "os": "android",
+    "host": "jiotvapi.media.jio.com",
+    "devicetype": "phone",
+    "appname": "RJIL_JioTV",
+    "Content-Type": "application/json",
+}
+
+PLAYBACK_UA = "plaYtv/7.1.5 (Linux;Android 9) ExoPlayerLib/2.11.7"
+
+LANGUAGES = {
+    1: "Hindi", 2: "Marathi", 3: "Punjabi", 4: "Urdu", 5: "Bengali",
+    6: "English", 7: "Malayalam", 8: "Tamil", 9: "Gujarati", 10: "Odia",
+    11: "Telugu", 12: "Bhojpuri", 13: "Kannada", 14: "Assamese",
+    15: "Nepali", 16: "French", 21: "Other",
+}
+
+CATEGORIES = {
+    5: "Entertainment", 6: "Movies", 7: "Kids", 8: "Sports", 9: "Lifestyle",
+    10: "Infotainment", 12: "News", 13: "Music", 15: "Devotional",
+    16: "Business", 17: "Educational", 18: "Shopping",
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _device_info() -> dict:
+    return {
+        "consumptionDeviceName": "unknown sdk_google_atv_x86",
+        "info": {
+            "type": "android",
+            "platform": {"name": "generic_x86"},
+            "androidId": str(uuid4()),
+        },
+    }
+
+
+def _is_session_expired() -> bool:
+    """Check if the ssotoken JWT is expired."""
+    token = SESSION.get("ssotoken", "")
+    if not token:
+        return True
+    try:
+        payload = token.split(".")[1]
+        # Fix base64 padding
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.b64decode(payload))
+        exp = data.get("exp")
+        if exp and time.time() > exp:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _build_playback_headers() -> dict:
+    """Build headers needed for geturl / stream requests."""
+    if not SESSION or not SESSION.get("ssotoken"):
+        raise HTTPException(status_code=401, detail="Not logged in")
+    if _is_session_expired():
+        raise HTTPException(status_code=401, detail="Session expired, please re-login")
+    return {
+        "appName": "RJIL_JioTV",
+        "deviceId": SESSION.get("deviceid", ""),
+        "devicetype": "phone",
+        "os": "android",
+        "osversion": "9",
+        "partner": "jiotvvod",
+        "user-agent": PLAYBACK_UA,
+        "usergroup": "tvYR7NSNn7rymo3F",
+        "versioncode": "396",
+        "platform": "ANDROID_PHONE",
+        "dm": "ZUK ZUK Z1",
+        "authtoken": SESSION.get("authtoken", ""),
+        "ssotoken": SESSION.get("ssotoken", ""),
+        "userid": SESSION.get("userid", ""),
+        "uniqueid": SESSION.get("uniqueid", ""),
+        "crmid": SESSION.get("crmid", ""),
+        "subscriberid": SESSION.get("subscriberid", ""),
+    }
+
+
+def _sony_headers() -> dict:
+    """Sony-channel specific headers (SAB TV etc.)."""
+    base = _build_playback_headers()
+    base.update({
+        "Host": "jiotvapi.media.jio.com",
+        "Appkey": "NzNiMDhlYzQyNjJm",
+        "Osversion": "11",
+        "Dm": "Google Pixel 5",
+        "Uniqueid": SESSION.get("deviceid", ""),
+        "Languageid": "6",
+        "Sid": "892898ba-f9de-4572-b6c2-e717b0ad",
+        "Isott": "false",
+        "Lbcookie": "1",
+        "Accesstoken": SESSION.get("authtoken", ""),
+        "Subscriberid": SESSION.get("subscriberid", ""),
+        "analyticsId": SESSION.get("deviceid", ""),
+    })
+    return base
+
+
+def _extract_cookie(stream_url: str) -> str:
+    """Extract __hdnea__ cookie from stream URL."""
+    if "__hdnea__" in stream_url:
+        return "__hdnea__" + stream_url.split("__hdnea__")[-1]
+    return ""
+
+
+def _fix_key_url(url: str, base_url: str) -> str:
+    """Rewrite key URLs from tv.media.jio.com/fallback/... to the CDN host.
+
+    The key server at tv.media.jio.com returns 403 for direct requests.
+    The same key is accessible on the CDN under the same path (minus /fallback/)
+    when the __hdnea__ cookie is provided.
+    """
+    if "tv.media.jio.com/fallback/" in url:
+        # Extract the CDN host from the base m3u8 URL
+        parsed = urlparse(base_url)
+        cdn_host = parsed.scheme + "://" + parsed.netloc
+        # Strip the /fallback prefix to get the CDN path
+        key_path = url.split("tv.media.jio.com/fallback", 1)[1]
+        return cdn_host + key_path
+    return url
+
+
+def _resolve_url(relative: str, base_url: str) -> str:
+    """Resolve a possibly-relative URL against a base URL."""
+    if relative.startswith("http"):
+        return _fix_key_url(relative, base_url)
+    # Strip query params before resolving — they contain '/' in __hdnea__ values
+    base_no_query = base_url.split("?")[0]
+    base_dir = base_no_query.rsplit("/", 1)[0]
+    return base_dir + "/" + relative
+
+
+def _proxy_url_for(url: str, request_base: str) -> str:
+    """Build proxy URL for a given upstream URL."""
+    if ".m3u8" in url.split("?")[0] or ".m3u8?" in url:
+        return request_base + "/api/proxy/m3u8?url=" + quote(url, safe="")
+    return request_base + "/api/proxy/segment?url=" + quote(url, safe="")
+
+
+def _rewrite_m3u8(body: str, base_url: str, cookie: str, request_base: str) -> str:
+    """Rewrite URLs inside an m3u8 manifest to go through our proxy."""
+    lines = body.splitlines()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped and not stripped.startswith("#"):
+            # Bare URL line (segment or sub-playlist)
+            url = _resolve_url(stripped, base_url)
+            out.append(_proxy_url_for(url, request_base))
+
+        elif stripped.startswith("#"):
+            # Rewrite URI="..." attributes inside # tags
+            # e.g. #EXT-X-MAP:URI="init.mp4", #EXT-X-KEY:...URI="https://..."
+            def replace_uri(match):
+                raw = match.group(1)
+                url = _resolve_url(raw, base_url)
+                proxied = _proxy_url_for(url, request_base)
+                return f'URI="{proxied}"'
+
+            rewritten = re.sub(r'URI="([^"]+)"', replace_uri, stripped)
+            out.append(rewritten)
+        else:
+            out.append(line)
+
+    return "\n".join(out)
+
+
+def _get_request_base(request: Request) -> str:
+    """Get the base URL of this server from the incoming request."""
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost:8888"))
+    return f"{scheme}://{host}"
+
+
+def _update_url_token(url: str, cookie: str) -> str:
+    """Replace or append the __hdnea__ token in a URL."""
+    if not cookie:
+        return url
+    if "__hdnea__" in url:
+        base = url.split("__hdnea__")[0].rstrip("?&")
+    else:
+        base = url
+    separator = "?" if "?" not in base else "&"
+    return base + separator + cookie
+
+
+async def _refresh_stream_token() -> str:
+    """Re-call JioTV geturl API to get a fresh CDN token.
+
+    Uses asyncio.Lock to prevent thundering-herd when many concurrent
+    requests all discover the token is expired at the same time.
+    """
+    async with _token_lock:
+        # Double-check: another coroutine may have refreshed while we waited
+        token_ts = SESSION.get("_token_ts", 0)
+        if time.time() - token_ts < 30:
+            return SESSION.get("_cookie", "")
+
+        channel_id = SESSION.get("_channel_id")
+        if not channel_id:
+            return SESSION.get("_cookie", "")
+
+        try:
+            headers = _sony_headers()
+            resp = await _http_client.post(
+                "https://jiotvapi.media.jio.com/playback/apis/v1/geturl?langId=6",
+                data={"stream_type": "Live", "channel_id": channel_id},
+                headers=headers,
+            )
+            data = resp.json()
+            stream_url = data.get("result", "")
+            if stream_url and stream_url.startswith("http"):
+                cookie = _extract_cookie(stream_url)
+                SESSION["_cookie"] = cookie
+                SESSION["_raw_stream_url"] = stream_url
+                SESSION["_token_ts"] = time.time()
+                _save_session()
+                print(f"[token] refreshed for channel {channel_id}")
+                return cookie
+        except Exception as e:
+            print(f"[token] refresh failed: {e}")
+
+        return SESSION.get("_cookie", "")
+
+
+async def _ensure_fresh_token() -> str:
+    """Return the current cookie, refreshing proactively if it's too old."""
+    token_ts = SESSION.get("_token_ts", 0)
+    if time.time() - token_ts > TOKEN_MAX_AGE:
+        return await _refresh_stream_token()
+    return SESSION.get("_cookie", "")
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+class SendOtpReq(BaseModel):
+    mobile: str
+
+class VerifyOtpReq(BaseModel):
+    mobile: str
+    otp: str
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/session")
+async def check_session():
+    """Check if a valid session exists."""
+    if SESSION and SESSION.get("ssotoken"):
+        return {"status": "ok", "logged_in": True}
+    return {"status": "ok", "logged_in": False}
+
+
+@app.post("/api/send-otp")
+async def send_otp(body: SendOtpReq):
+    mobile = "+91" + body.mobile
+    encoded = base64.b64encode(mobile.encode("ascii")).decode("ascii")
+    resp = await _http_client.post(
+        "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/send",
+        json={"number": encoded},
+        headers=OTP_HEADERS,
+    )
+    if resp.status_code == 204 or resp.status_code == 200:
+        return {"status": "ok", "message": "OTP sent"}
+    return {"status": "error", "message": resp.text, "code": resp.status_code}
+
+
+@app.post("/api/verify-otp")
+async def verify_otp(body: VerifyOtpReq):
+    global SESSION
+    mobile = "+91" + body.mobile
+    encoded = base64.b64encode(mobile.encode("ascii")).decode("ascii")
+    payload = {
+        "number": encoded,
+        "otp": body.otp,
+        "deviceInfo": _device_info(),
+    }
+    resp = await _http_client.post(
+        "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/verify",
+        json=payload,
+        headers=OTP_HEADERS,
+    )
+    data = resp.json()
+    if not data.get("ssoToken"):
+        raise HTTPException(status_code=401, detail=data)
+
+    SESSION = {
+        "ssotoken": data.get("ssoToken", ""),
+        "userid": data.get("sessionAttributes", {}).get("user", {}).get("uid", ""),
+        "uniqueid": data.get("sessionAttributes", {}).get("user", {}).get("unique", ""),
+        "crmid": data.get("sessionAttributes", {}).get("user", {}).get("subscriberId", ""),
+        "subscriberid": data.get("sessionAttributes", {}).get("user", {}).get("subscriberId", ""),
+        "authtoken": data.get("authToken", ""),
+        "jtoken": data.get("jToken", ""),
+        "deviceid": data.get("deviceId", ""),
+    }
+    _save_session()
+    return {"status": "ok", "message": "Login successful"}
+
+
+@app.get("/api/filters")
+async def get_filters():
+    """Return available language and category options."""
+    return {
+        "languages": [{"id": k, "name": v} for k, v in sorted(LANGUAGES.items(), key=lambda x: x[1])],
+        "categories": [{"id": k, "name": v} for k, v in sorted(CATEGORIES.items(), key=lambda x: x[1])],
+    }
+
+
+@app.get("/api/channels")
+async def get_channels(lang: str = "", cat: str = ""):
+    url = (
+        "https://jiotvapi.cdn.jio.com/apis/v3.0/getMobileChannelList/get/"
+        "?langId=6&devicetype=phone&os=android&usertype=JIO&version=396"
+    )
+    resp = await _http_client.get(url)
+    data = resp.json()
+    channels = data.get("result", [])
+
+    # Always filter to Hindi(1), Punjabi(3)
+    ALLOWED_LANGS = {1, 3}
+    channels = [ch for ch in channels if ch.get("channelLanguageId") in ALLOWED_LANGS]
+
+    cat_ids = {int(x) for x in cat.split(",") if x.strip()} if cat else set()
+    if cat_ids:
+        channels = [ch for ch in channels if ch.get("channelCategoryId") in cat_ids]
+
+    # Enrich with names
+    for ch in channels:
+        ch["languageName"] = LANGUAGES.get(ch.get("channelLanguageId", 0), "")
+        ch["categoryName"] = CATEGORIES.get(ch.get("channelCategoryId", 0), "")
+
+    return {"result": channels}
+
+
+@app.get("/api/play/{channel_id}")
+async def play_channel(channel_id: str, request: Request):
+    base = _get_request_base(request)
+
+    # Check cache first for instant response
+    cached = _get_cached_stream(channel_id)
+    if cached:
+        cookie = cached["cookie"]
+        SESSION["_cookie"] = cookie
+        SESSION["_channel_id"] = channel_id
+        SESSION["_raw_stream_url"] = cached["raw_url"]
+        SESSION["_token_ts"] = cached["ts"]
+        _save_session()
+        return {"url": cached["url"], "cookie": cookie, "raw_url": cached["raw_url"]}
+
+    headers = _sony_headers()
+    resp = await _http_client.post(
+        "https://jiotvapi.media.jio.com/playback/apis/v1/geturl?langId=6",
+        data={"stream_type": "Live", "channel_id": channel_id},
+        headers=headers,
+    )
+    data = resp.json()
+    stream_url = data.get("result", "")
+
+    if not stream_url or not stream_url.startswith("http"):
+        # Check if this looks like an auth failure
+        error_code = data.get("code") or data.get("errorCode") or ""
+        error_msg = data.get("message") or data.get("errorMessage") or ""
+        if _is_session_expired() or str(error_code) in ("401", "403", "110"):
+            raise HTTPException(status_code=401, detail={
+                "message": "Session expired, please re-login",
+                "api_response": data,
+            })
+        raise HTTPException(status_code=502, detail={
+            "message": "JioTV returned no stream URL",
+            "api_response": data,
+        })
+
+    cookie = _extract_cookie(stream_url)
+
+    # Store cookie + metadata for proxy & auto-refresh
+    SESSION["_cookie"] = cookie
+    SESSION["_channel_id"] = channel_id
+    SESSION["_raw_stream_url"] = stream_url
+    SESSION["_token_ts"] = time.time()
+    _save_session()
+
+    # Cache this stream URL
+    proxy_url = base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
+    _stream_cache[channel_id] = {
+        "url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(),
+    }
+
+    return {"url": proxy_url, "cookie": cookie, "raw_url": stream_url}
+
+
+# ---------------------------------------------------------------------------
+# Stream URL cache for instant channel switching
+# ---------------------------------------------------------------------------
+# { channel_id: { "url": proxy_url, "cookie": cookie, "ts": timestamp } }
+_stream_cache: dict = {}
+STREAM_CACHE_TTL = 60  # seconds
+
+
+def _get_cached_stream(channel_id: str) -> dict | None:
+    entry = _stream_cache.get(channel_id)
+    if entry and time.time() - entry["ts"] < STREAM_CACHE_TTL:
+        return entry
+    return None
+
+
+async def _fetch_and_cache_stream(channel_id: str, request_base: str) -> dict:
+    """Fetch stream URL from JioTV and cache it."""
+    cached = _get_cached_stream(channel_id)
+    if cached:
+        return cached
+
+    try:
+        headers = _sony_headers()
+        resp = await _http_client.post(
+            "https://jiotvapi.media.jio.com/playback/apis/v1/geturl?langId=6",
+            data={"stream_type": "Live", "channel_id": channel_id},
+            headers=headers,
+        )
+        data = resp.json()
+        stream_url = data.get("result", "")
+        if stream_url and stream_url.startswith("http"):
+            cookie = _extract_cookie(stream_url)
+            proxy_url = request_base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
+            entry = {"url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time()}
+            _stream_cache[channel_id] = entry
+            return entry
+    except Exception as e:
+        print(f"[prewarm] failed for {channel_id}: {e}")
+    return {}
+
+
+@app.post("/api/prewarm")
+async def prewarm_channels(request: Request):
+    """Pre-fetch stream URLs for given channel IDs (fire-and-forget from app)."""
+    body = await request.json()
+    channel_ids = body.get("channel_ids", [])
+    if not channel_ids:
+        return {"status": "ok", "prewarmed": 0}
+
+    request_base = _get_request_base(request)
+    # Fetch all in parallel
+    results = await asyncio.gather(
+        *[_fetch_and_cache_stream(str(cid), request_base) for cid in channel_ids],
+        return_exceptions=True,
+    )
+    count = sum(1 for r in results if isinstance(r, dict) and r.get("url"))
+    return {"status": "ok", "prewarmed": count}
+
+
+@app.get("/api/catchup/{channel_id}")
+async def get_catchup(channel_id: str, offset: int = 0):
+    url = (
+        f"https://jiotvapi.cdn.jio.com/apis/v1.3/getepg/get"
+        f"?offset={offset}&channel_id={channel_id}&langId=6"
+    )
+    resp = await _http_client.get(url)
+    return resp.json()
+
+
+@app.get("/api/play/{channel_id}/catchup")
+async def play_catchup(
+    channel_id: str,
+    request: Request,
+    showtime: str = "",
+    srno: str = "",
+    programId: str = "",
+    begin: str = "",
+    end: str = "",
+):
+    headers = _sony_headers()
+    resp = await _http_client.post(
+        "https://jiotvapi.media.jio.com/playback/apis/v1/geturl?langId=6",
+        data={
+            "channel_id": channel_id,
+            "stream_type": "Catchup",
+            "begin": begin,
+            "end": end,
+            "showtime": showtime,
+            "srno": srno,
+            "programId": programId,
+        },
+        headers=headers,
+    )
+    data = resp.json()
+    stream_url = data.get("result", "")
+
+    if not stream_url or not stream_url.startswith("http"):
+        error_code = data.get("code") or data.get("errorCode") or ""
+        if _is_session_expired() or str(error_code) in ("401", "403", "110"):
+            raise HTTPException(status_code=401, detail={
+                "message": "Session expired, please re-login",
+                "api_response": data,
+            })
+        raise HTTPException(status_code=502, detail={
+            "message": "JioTV returned no catchup stream URL",
+            "api_response": data,
+        })
+
+    cookie = _extract_cookie(stream_url)
+    SESSION["_cookie"] = cookie
+    _save_session()
+    base = _get_request_base(request)
+    proxy_url = base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
+    return {"url": proxy_url, "cookie": cookie, "raw_url": stream_url}
+
+
+@app.get("/api/proxy/m3u8")
+async def proxy_m3u8(url: str, request: Request):
+    """Proxy an m3u8 manifest, rewriting inner URLs to also go through proxy."""
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Missing or invalid url parameter")
+
+    try:
+        cookie = await _ensure_fresh_token()
+        headers = {"user-agent": PLAYBACK_UA, "cookie": cookie}
+        fetch_url = _update_url_token(url, cookie)
+
+        resp = await _http_client.get(fetch_url, headers=headers)
+
+        # Token expired → force refresh and retry once
+        if resp.status_code in (403, 410, 401):
+            print(f"[m3u8] upstream {resp.status_code}, refreshing token…")
+            cookie = await _refresh_stream_token()
+            headers["cookie"] = cookie
+            fetch_url = _update_url_token(url, cookie)
+            resp = await _http_client.get(fetch_url, headers=headers)
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"Upstream m3u8 returned {resp.status_code}",
+            )
+
+        body = resp.text
+        request_base = _get_request_base(request)
+        rewritten = _rewrite_m3u8(body, fetch_url, cookie, request_base)
+        return Response(
+            content=rewritten,
+            media_type=resp.headers.get("content-type", "application/vnd.apple.mpegurl"),
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        print(f"[m3u8] timeout fetching {url[:80]}…")
+        raise HTTPException(status_code=504, detail="Upstream m3u8 timed out")
+    except Exception as e:
+        print(f"[m3u8] error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch m3u8")
+
+
+@app.get("/api/debug/m3u8")
+async def debug_m3u8(url: str, request: Request):
+    """Debug: show raw + rewritten m3u8 side by side."""
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Missing or invalid url parameter")
+    cookie = SESSION.get("_cookie", "")
+    headers = {"user-agent": PLAYBACK_UA, "cookie": cookie}
+    resp = await _http_client.get(url, headers=headers)
+    raw = resp.text
+    request_base = _get_request_base(request)
+    rewritten = _rewrite_m3u8(raw, url, cookie, request_base)
+    return {"raw": raw, "rewritten": rewritten, "status": resp.status_code}
+
+
+@app.get("/api/proxy/segment")
+async def proxy_segment(url: str):
+    """Proxy a TS/segment request — validates upstream status before streaming."""
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Missing or invalid url parameter")
+
+    try:
+        cookie = await _ensure_fresh_token()
+        headers = {"user-agent": PLAYBACK_UA, "cookie": cookie}
+        fetch_url = _update_url_token(url, cookie)
+
+        # Open a streaming request on the shared client
+        req = _http_client.build_request("GET", fetch_url, headers=headers)
+        resp = await _http_client.send(req, stream=True)
+
+        # Token expired → refresh and retry once
+        if resp.status_code in (403, 410, 401):
+            await resp.aclose()
+            print(f"[segment] upstream {resp.status_code}, refreshing token…")
+            cookie = await _refresh_stream_token()
+            headers["cookie"] = cookie
+            fetch_url = _update_url_token(url, cookie)
+            req = _http_client.build_request("GET", fetch_url, headers=headers)
+            resp = await _http_client.send(req, stream=True)
+
+        # If still failing, return real HTTP error so ExoPlayer can handle it
+        if resp.status_code != 200:
+            status = resp.status_code
+            await resp.aclose()
+            raise HTTPException(
+                status_code=status,
+                detail=f"Upstream segment returned {status}",
+            )
+
+        content_type = resp.headers.get("content-type", "video/mp2t")
+        content_length = resp.headers.get("content-length")
+
+        async def stream():
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=524288):
+                    if chunk:
+                        yield chunk
+            finally:
+                await resp.aclose()
+
+        resp_headers = {"Cache-Control": "no-cache, no-store"}
+        if content_length:
+            resp_headers["Content-Length"] = content_length
+        return StreamingResponse(stream(), media_type=content_type, headers=resp_headers)
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        print(f"[segment] timeout fetching {url[:80]}…")
+        raise HTTPException(status_code=504, detail="Upstream segment timed out")
+    except Exception as e:
+        print(f"[segment] error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch segment")
+
+
+# ---------------------------------------------------------------------------
+# Remote Control — room management + WebSocket relay
+# ---------------------------------------------------------------------------
+# rooms: { "1234": { "tv": WebSocket | None, "remote": WebSocket | None, "created_at": float } }
+rooms: dict = {}
+
+ROOM_EXPIRY_SECS = 3600  # 1 hour
+
+
+def _generate_room_code() -> str:
+    """Generate a unique 4-digit room code."""
+    _cleanup_expired_rooms()
+    for _ in range(100):
+        code = str(random.randint(1000, 9999))
+        if code not in rooms:
+            return code
+    raise HTTPException(status_code=503, detail="Could not generate room code")
+
+
+def _cleanup_expired_rooms():
+    """Remove rooms older than 1 hour."""
+    now = time.time()
+    expired = [code for code, room in rooms.items() if now - room["created_at"] > ROOM_EXPIRY_SECS]
+    for code in expired:
+        rooms.pop(code, None)
+
+
+@app.post("/api/remote/create-room")
+async def create_room():
+    code = _generate_room_code()
+    rooms[code] = {"tv": None, "remote": None, "created_at": time.time()}
+    return {"code": code}
+
+
+@app.get("/api/remote/check-room/{code}")
+async def check_room(code: str):
+    _cleanup_expired_rooms()
+    if code not in rooms:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {"code": code, "exists": True}
+
+
+@app.websocket("/ws/remote/{room_code}")
+async def ws_remote(websocket: WebSocket, room_code: str):
+    role = websocket.query_params.get("role", "")
+    await websocket.accept()
+
+    if role not in ("tv", "remote"):
+        await websocket.send_json({"type": "error", "message": "Invalid role"})
+        await websocket.close(code=4000)
+        return
+    if room_code not in rooms:
+        await websocket.send_json({"type": "error", "message": "Room not found"})
+        await websocket.close(code=4001)
+        return
+
+    room = rooms[room_code]
+    room[role] = websocket
+    peer_role = "remote" if role == "tv" else "tv"
+
+    # Notify the other side that a peer joined
+    peer = room.get(peer_role)
+    if peer:
+        try:
+            await peer.send_json({"type": "peer_joined", "role": role})
+        except Exception:
+            pass
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            # Handle both text and disconnect frames
+            if msg.get("type") == "websocket.disconnect":
+                break
+            text = msg.get("text")
+            if text is None:
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            # Relay to the other side
+            other = room.get(peer_role)
+            if other:
+                try:
+                    await other.send_json(data)
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[remote ws] error room={room_code} role={role}: {e}")
+    finally:
+        # Clean up
+        if room_code in rooms:
+            rooms[room_code][role] = None
+            # Notify peer about disconnect
+            other = rooms[room_code].get(peer_role)
+            if other:
+                try:
+                    await other.send_json({"type": "peer_left", "role": role})
+                except Exception:
+                    pass
+            # If TV disconnects, destroy the room
+            if role == "tv":
+                rooms.pop(room_code, None)

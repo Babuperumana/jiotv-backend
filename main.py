@@ -68,7 +68,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Session persistence (single-user POC)
 # ---------------------------------------------------------------------------
-SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.json")
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+SESSION_FILE = os.path.join(DATA_DIR, "session.json")
+STREAM_CACHE_FILE = os.path.join(DATA_DIR, "stream_cache.json")
 SESSION: dict = {}
 
 

@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -423,7 +423,7 @@ async def get_channels(lang: str = "", cat: str = ""):
     channels = data.get("result", [])
 
     # Always filter to Hindi(1), Punjabi(3)
-    ALLOWED_LANGS = {1, 3}
+    ALLOWED_LANGS = {1, 6, 7, 8}
     channels = [ch for ch in channels if ch.get("channelLanguageId") in ALLOWED_LANGS]
 
     cat_ids = {int(x) for x in cat.split(",") if x.strip()} if cat else set()
@@ -436,6 +436,55 @@ async def get_channels(lang: str = "", cat: str = ""):
         ch["categoryName"] = CATEGORIES.get(ch.get("channelCategoryId", 0), "")
 
     return {"result": channels}
+
+
+@app.get("/playlist.m3u")
+async def get_playlist(request: Request):
+    """Generate M3U playlist for all available channels."""
+    channels_resp = await get_channels()
+    channels = channels_resp.get("result", [])
+    
+    request_base = _get_request_base(request)
+    
+    lines = ["#EXTM3U"]
+    for ch in channels:
+        cid = ch.get("channel_id")
+        name = ch.get("channel_name", "Unknown")
+        logo = ch.get("logoUrl", "")
+        if logo:
+            logo = f"http://jiotv.catchup.cdn.jio.com/dare_images/images/{logo}"
+        group = ch.get("categoryName", "Unknown")
+        
+        # Build EXTINF line
+        extinf = f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{name}" tvg-logo="{logo}" group-title="{group}",{name}'
+        lines.append(extinf)
+        
+        # Add Widevine DRM properties for likely encrypted channels (Star, Sony, Viacom18, etc.)
+        # This tells TiviMate/Kodi to initialize the DRM decryptor.
+        is_premium = ch.get("is_premium")
+        broadcaster = ch.get("broadcasterId")
+        if is_premium or broadcaster in (6, 230, 55):
+            lines.append('#KODIPROP:inputstream.adaptive.license_type=clearkey')
+            lines.append(f'#KODIPROP:inputstream.adaptive.license_key=https://keys2.cply.dpdns.org/key?id={cid}')
+            lines.append('#EXTVLCOPT:http-user-agent=plaYtv/7.1.3 (Linux;Android 13) - @CloudPlay - ExoPlayerLib/824.0')
+        
+        # Stream URL
+        stream_url = f"{request_base}/api/stream/{cid}.m3u8"
+        lines.append(stream_url)
+        
+    return PlainTextResponse("\n".join(lines))
+
+
+@app.get("/api/stream/{channel_id}.m3u8")
+async def stream_channel_direct(channel_id: str, request: Request):
+    """Direct stream URL for a channel. Redirects to the proxied m3u8."""
+    # Play channel function already does the hard work (fetching, caching, generating proxy URL)
+    data = await play_channel(channel_id, request)
+    proxy_url = data.get("url")
+    if not proxy_url:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    
+    return RedirectResponse(url=proxy_url)
 
 
 @app.get("/api/play/{channel_id}")
@@ -461,6 +510,30 @@ async def play_channel(channel_id: str, request: Request):
     )
     data = resp.json()
     stream_url = data.get("result", "")
+    
+    is_mpd = False
+    key_url = ""
+    hls_url = data.get("result", "")
+    
+    # Check if HLS URL is valid (returns 200). If it returns 404, fallback to MPD (DRM channel)
+    hls_valid = False
+    if hls_url and hls_url.startswith("http"):
+        try:
+            h_resp = await _http_client.head(hls_url, headers={"user-agent": PLAYBACK_UA}, follow_redirects=True, timeout=3.0)
+            if h_resp.status_code == 200:
+                hls_valid = True
+                stream_url = hls_url
+        except:
+            pass
+            
+    if not hls_valid:
+        mpd_data = data.get("mpd")
+        if mpd_data and mpd_data.get("result"):
+            stream_url = mpd_data.get("result")
+            is_mpd = True
+            key_url = mpd_data.get("key", "")
+        else:
+            stream_url = hls_url # fallback to whatever was originally there
 
     if not stream_url or not stream_url.startswith("http"):
         # Check if this looks like an auth failure
@@ -486,10 +559,16 @@ async def play_channel(channel_id: str, request: Request):
     _save_session()
 
     # Cache this stream URL
-    proxy_url = base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
-    _stream_cache[channel_id] = {
-        "url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(),
-    }
+    if is_mpd:
+        proxy_url = base + f"/api/proxy/mpd?cid={channel_id}&url=" + quote(stream_url, safe="")
+        _stream_cache[channel_id] = {
+            "url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(), "key_url": key_url, "is_mpd": True
+        }
+    else:
+        proxy_url = base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
+        _stream_cache[channel_id] = {
+            "url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(), "is_mpd": False
+        }
 
     return {"url": proxy_url, "cookie": cookie, "raw_url": stream_url}
 
@@ -524,10 +603,38 @@ async def _fetch_and_cache_stream(channel_id: str, request_base: str) -> dict:
         )
         data = resp.json()
         stream_url = data.get("result", "")
+        
+        is_mpd = False
+        key_url = ""
+        hls_url = data.get("result", "")
+        
+        hls_valid = False
+        if hls_url and hls_url.startswith("http"):
+            try:
+                h_resp = await _http_client.head(hls_url, headers={"user-agent": PLAYBACK_UA}, follow_redirects=True, timeout=3.0)
+                if h_resp.status_code == 200:
+                    hls_valid = True
+                    stream_url = hls_url
+            except:
+                pass
+                
+        if not hls_valid:
+            mpd_data = data.get("mpd")
+            if mpd_data and mpd_data.get("result"):
+                stream_url = mpd_data.get("result")
+                is_mpd = True
+                key_url = mpd_data.get("key", "")
+            else:
+                stream_url = hls_url
+
         if stream_url and stream_url.startswith("http"):
             cookie = _extract_cookie(stream_url)
-            proxy_url = request_base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
-            entry = {"url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time()}
+            if is_mpd:
+                proxy_url = request_base + f"/api/proxy/mpd?cid={channel_id}&url=" + quote(stream_url, safe="")
+                entry = {"url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(), "key_url": key_url, "is_mpd": True}
+            else:
+                proxy_url = request_base + "/api/proxy/m3u8?url=" + quote(stream_url, safe="")
+                entry = {"url": proxy_url, "cookie": cookie, "raw_url": stream_url, "ts": time.time(), "is_mpd": False}
             _stream_cache[channel_id] = entry
             return entry
     except Exception as e:
@@ -610,6 +717,120 @@ async def play_catchup(
     return {"url": proxy_url, "cookie": cookie, "raw_url": stream_url}
 
 
+@app.get("/api/proxy/mpd")
+async def proxy_mpd(url: str, request: Request, cid: str = ""):
+    """Proxy an MPD manifest, rewriting SegmentTemplate to include token."""
+    if not url or not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Missing or invalid url parameter")
+
+    try:
+        cookie = await _ensure_fresh_token()
+        headers = {"user-agent": PLAYBACK_UA, "cookie": cookie}
+        fetch_url = _update_url_token(url, cookie)
+
+        resp = await _http_client.get(fetch_url, headers=headers)
+        
+        if resp.status_code in (403, 410, 401):
+            cookie = await _refresh_stream_token()
+            headers["cookie"] = cookie
+            fetch_url = _update_url_token(url, cookie)
+            resp = await _http_client.get(fetch_url, headers=headers)
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"Upstream mpd returned {resp.status_code}")
+
+        xml = resp.text
+        # We need the token to append to segment URLs
+        token = ""
+        if "__hdnea__" in fetch_url:
+            parsed = urlparse(fetch_url)
+            qs = parse_qs(parsed.query)
+            if "__hdnea__" in qs:
+                token = qs["__hdnea__"][0]
+
+        request_base = _get_request_base(request)
+        
+        # We redirect segment fetches through our proxy (which returns a 302 redirect) 
+        # so that the token is ALWAYS freshly generated right when the player fetches the segment.
+        # This completely eliminates 403 expiry errors while saving local bandwidth!
+        xml = xml.replace('<BaseURL>dash/</BaseURL>', '')
+        base_dir = fetch_url.split("?")[0].rsplit("/", 1)[0] + "/dash/"
+        proxy_prefix = f'{request_base}/api/proxy/segment?url={quote(base_dir, safe="")}'
+        
+        # Rewrite SegmentTemplate
+        xml = xml.replace('initialization="', f'initialization="{proxy_prefix}')
+        xml = xml.replace('media="', f'media="{proxy_prefix}')
+
+        # Inject dashif:Laurl if cid is provided and channel has DRM key
+        has_key = False
+        if cid:
+            cached = _get_cached_stream(cid)
+            if cached and cached.get("key_url"):
+                has_key = True
+                
+        if has_key:
+            request_base = _get_request_base(request)
+            laurl = f'<dashif:Laurl>{request_base}/api/proxy/key?cid={cid}</dashif:Laurl>'
+            xml = xml.replace('<MPD xmlns:xsi=', '<MPD xmlns:dashif="https://dashif.org/CPI" xmlns:xsi=')
+            wv_tag = '<ContentProtection schemeIdUri="urn:uuid:EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED">'
+            xml = xml.replace(wv_tag, f'{wv_tag}\n        {laurl}')
+            
+        # Strip SCTE-35 EventStreams to prevent ExoPlayer extractor errors in TiviMate
+        import re
+        xml = re.sub(r'<EventStream.*?</EventStream>', '', xml, flags=re.DOTALL)
+        xml = re.sub(r'<InbandEventStream.*?</InbandEventStream>', '', xml, flags=re.DOTALL)
+        # Also remove any self-closing tags just in case
+        xml = re.sub(r'<EventStream.*?/>', '', xml)
+        xml = re.sub(r'<InbandEventStream.*?/>', '', xml)
+
+        return Response(
+            content=xml,
+            media_type="application/dash+xml",
+            headers={"Cache-Control": "no-cache, no-store"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[mpd] error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch mpd")
+
+
+@app.post("/api/proxy/key")
+async def proxy_key(request: Request, cid: str = ""):
+    """Proxy Widevine DRM license requests for JioTV."""
+    body = await request.body()
+    
+    key_url = ""
+    cached = None
+    data = None
+    # We can use the cid to get the key_url from cache, or fetch it
+    if cid:
+        cached = _get_cached_stream(cid)
+        if cached and cached.get("key_url"):
+            key_url = cached["key_url"]
+        else:
+            data = await _fetch_and_cache_stream(cid, _get_request_base(request))
+            key_url = data.get("key_url", "")
+            
+    if not key_url:
+        key_url = request.query_params.get("url", "")
+        
+    if not key_url or not key_url.startswith("http"):
+        raise HTTPException(status_code=404, detail=f"Key URL not found for {cid}")
+        
+    headers = _sony_headers()
+    try:
+        resp = await _http_client.post(key_url, content=body, headers=headers)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/octet-stream")
+        )
+    except Exception as e:
+        print(f"[key proxy] error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to proxy key")
+
+
 @app.get("/api/proxy/m3u8")
 async def proxy_m3u8(url: str, request: Request):
     """Proxy an m3u8 manifest, rewriting inner URLs to also go through proxy."""
@@ -671,61 +892,22 @@ async def debug_m3u8(url: str, request: Request):
 
 @app.get("/api/proxy/segment")
 async def proxy_segment(url: str):
-    """Proxy a TS/segment request — validates upstream status before streaming."""
+    """Proxy a TS/segment request via 302 redirect to ensure fresh token and save bandwidth."""
     if not url or not url.startswith("http"):
         raise HTTPException(status_code=400, detail="Missing or invalid url parameter")
 
     try:
         cookie = await _ensure_fresh_token()
-        headers = {"user-agent": PLAYBACK_UA, "cookie": cookie}
         fetch_url = _update_url_token(url, cookie)
-
-        # Open a streaming request on the shared client
-        req = _http_client.build_request("GET", fetch_url, headers=headers)
-        resp = await _http_client.send(req, stream=True)
-
-        # Token expired → refresh and retry once
-        if resp.status_code in (403, 410, 401):
-            await resp.aclose()
-            print(f"[segment] upstream {resp.status_code}, refreshing token…")
-            cookie = await _refresh_stream_token()
-            headers["cookie"] = cookie
-            fetch_url = _update_url_token(url, cookie)
-            req = _http_client.build_request("GET", fetch_url, headers=headers)
-            resp = await _http_client.send(req, stream=True)
-
-        # If still failing, return real HTTP error so ExoPlayer can handle it
-        if resp.status_code != 200:
-            status = resp.status_code
-            await resp.aclose()
-            raise HTTPException(
-                status_code=status,
-                detail=f"Upstream segment returned {status}",
-            )
-
-        content_type = resp.headers.get("content-type", "video/mp2t")
-        content_length = resp.headers.get("content-length")
-
-        async def stream():
-            try:
-                async for chunk in resp.aiter_bytes(chunk_size=524288):
-                    if chunk:
-                        yield chunk
-            finally:
-                await resp.aclose()
-
-        resp_headers = {"Cache-Control": "no-cache, no-store"}
-        if content_length:
-            resp_headers["Content-Length"] = content_length
-        return StreamingResponse(stream(), media_type=content_type, headers=resp_headers)
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        print(f"[segment] timeout fetching {url[:80]}…")
-        raise HTTPException(status_code=504, detail="Upstream segment timed out")
+        
+        # We use a 302 redirect so the player downloads the actual video data 
+        # directly from Jio CDN. This saves massive local bandwidth while still
+        # ensuring the token is always fresh to prevent 403 errors!
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=fetch_url, status_code=302)
     except Exception as e:
         print(f"[segment] error: {e}")
-        raise HTTPException(status_code=502, detail="Failed to fetch segment")
+        raise HTTPException(status_code=502, detail="Failed to proxy segment")
 
 
 # ---------------------------------------------------------------------------

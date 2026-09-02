@@ -1,5 +1,7 @@
+venv/
 __pycache__/
 *.pyc
-session.json
 .env
-.claude/
+session.json
+stream_cache.json
+.DS_Store

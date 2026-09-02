@@ -474,6 +474,21 @@ async def get_playlist(request: Request):
         stream_url = f"{request_base}/api/stream/{cid}.m3u8"
         lines.append(stream_url)
         
+    # Append external VOD playlist if available
+    try:
+        ext_playlist_url = "https://raw.githubusercontent.com/Babuperumana/movies_m3u/refs/heads/main/playlist.m3u"
+        resp = await _http_client.get(ext_playlist_url, timeout=5.0)
+        if resp.status_code == 200:
+            vod_lines = resp.text.splitlines()
+            # Skip the first #EXTM3U line if it exists
+            if vod_lines and vod_lines[0].strip().startswith("#EXTM3U"):
+                vod_lines = vod_lines[1:]
+            
+            lines.append("\n# --- VOD MOVIES (External) ---")
+            lines.extend(vod_lines)
+    except Exception as e:
+        print(f"Failed to fetch external VOD playlist: {e}")
+
     return PlainTextResponse("\n".join(lines))
 
 

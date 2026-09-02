@@ -448,6 +448,8 @@ async def get_playlist(request: Request):
     
     request_base = _get_request_base(request)
     
+    channels.sort(key=lambda x: (x.get("languageName", "Unknown"), x.get("categoryName", "Unknown"), x.get("channel_name", "")))
+
     lines = ["#EXTM3U"]
     for ch in channels:
         cid = ch.get("channel_id")
@@ -455,7 +457,7 @@ async def get_playlist(request: Request):
         logo = ch.get("logoUrl", "")
         if logo:
             logo = f"http://jiotv.catchup.cdn.jio.com/dare_images/images/{logo}"
-        group = ch.get("categoryName", "Unknown")
+        group = ch.get("languageName", "Unknown")
         
         # Build EXTINF line
         extinf = f'#EXTINF:-1 tvg-id="{cid}" tvg-name="{name}" tvg-logo="{logo}" group-title="{group}",{name}'

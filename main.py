@@ -305,6 +305,32 @@ async def _refresh_stream_token() -> str:
             return SESSION.get("_cookie", "")
 
         try:
+            raw_url = SESSION.get("_raw_stream_url")
+            if raw_url:
+                # Fast token refresh: Instead of calling the slow Jio API, we make a HEAD request
+                # to the CDN. Akamai CDN responds in ~50ms with a fresh __hdnea__ token in Set-Cookie!
+                # This prevents 2-second buffering stalls when token refreshes during MPD segment fetch.
+                h_resp = await _http_client.head(
+                    raw_url, 
+                    headers={"user-agent": PLAYBACK_UA}, 
+                    follow_redirects=True, 
+                    timeout=2.0
+                )
+                if h_resp.status_code == 200 and "set-cookie" in h_resp.headers:
+                    import re
+                    m = re.search(r"(__hdnea__=[^;]+)", h_resp.headers["set-cookie"])
+                    if m:
+                        cookie = m.group(1)
+                        SESSION["_cookie"] = cookie
+                        SESSION["_token_ts"] = time.time()
+                        _save_session()
+                        print(f"[token] refreshed via fast HEAD for channel {channel_id}")
+                        return cookie
+        except Exception as e:
+            print(f"[token] fast HEAD refresh failed: {e}")
+
+        # Fallback to the slow Jio API if HEAD trick didn't work
+        try:
             headers = _sony_headers()
             resp = await _http_client.post(
                 "https://jiotvapi.media.jio.com/playback/apis/v1/geturl?langId=6",
@@ -315,11 +341,21 @@ async def _refresh_stream_token() -> str:
             stream_url = data.get("result", "")
             if stream_url and stream_url.startswith("http"):
                 cookie = _extract_cookie(stream_url)
+                if not cookie:
+                    # If stream_url doesn't have token in QS, we try one last HEAD
+                    try:
+                        h_resp = await _http_client.head(stream_url, headers={"user-agent": PLAYBACK_UA}, follow_redirects=True, timeout=2.0)
+                        import re
+                        m = re.search(r"(__hdnea__=[^;]+)", h_resp.headers.get("set-cookie", ""))
+                        if m:
+                            cookie = m.group(1)
+                    except:
+                        pass
                 SESSION["_cookie"] = cookie
                 SESSION["_raw_stream_url"] = stream_url
                 SESSION["_token_ts"] = time.time()
                 _save_session()
-                print(f"[token] refreshed for channel {channel_id}")
+                print(f"[token] refreshed via Jio API for channel {channel_id}")
                 return cookie
         except Exception as e:
             print(f"[token] refresh failed: {e}")

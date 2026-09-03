@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse, PlainTextResponse, HTMLResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -405,6 +405,91 @@ async def verify_otp(body: VerifyOtpReq):
     return {"status": "ok", "message": "Login successful"}
 
 
+@app.post("/api/logout")
+async def logout():
+    """Clear session and delete session.json"""
+    global SESSION
+    SESSION = {}
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+    return {"status": "ok", "message": "Logged out successfully"}
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """Serve a simple HTML login page."""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>JioTV Login</title>
+        <style>
+            body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f0f2f5; }
+            .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+            input { width: calc(100% - 20px); padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+            button { width: 100%; padding: 10px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+            button:hover { background-color: #0056b3; }
+            #message { margin-top: 15px; color: #d9534f; }
+            #otp-section { display: none; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>JioTV Login</h2>
+            <div id="phone-section">
+                <input type="text" id="mobile" placeholder="Mobile Number (without +91)" required>
+                <button onclick="sendOtp()">Send OTP</button>
+            </div>
+            <div id="otp-section">
+                <input type="text" id="otp" placeholder="Enter OTP" required>
+                <button onclick="verifyOtp()">Verify OTP</button>
+            </div>
+            <p id="message"></p>
+        </div>
+        <script>
+            async function sendOtp() {
+                const mobile = document.getElementById('mobile').value;
+                document.getElementById('message').innerText = "Sending...";
+                const res = await fetch('/api/send-otp', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mobile})
+                });
+                const data = await res.json();
+                if(data.status === 'ok') {
+                    document.getElementById('phone-section').style.display = 'none';
+                    document.getElementById('otp-section').style.display = 'block';
+                    document.getElementById('message').innerText = "OTP sent to your number.";
+                    document.getElementById('message').style.color = "green";
+                } else {
+                    document.getElementById('message').innerText = data.message || "Failed to send OTP.";
+                }
+            }
+            async function verifyOtp() {
+                const mobile = document.getElementById('mobile').value;
+                const otp = document.getElementById('otp').value;
+                document.getElementById('message').innerText = "Verifying...";
+                const res = await fetch('/api/verify-otp', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mobile, otp})
+                });
+                if(res.ok) {
+                    document.getElementById('message').innerText = "Login successful! You can now use playlist.m3u";
+                    document.getElementById('message').style.color = "green";
+                } else {
+                    const data = await res.json();
+                    document.getElementById('message').innerText = data.detail || "Login failed.";
+                    document.getElementById('message').style.color = "red";
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 @app.get("/api/filters")
 async def get_filters():
     """Return available language and category options."""
@@ -558,7 +643,7 @@ async def play_channel(channel_id: str, request: Request):
         # Check if this looks like an auth failure
         error_code = data.get("code") or data.get("errorCode") or ""
         error_msg = data.get("message") or data.get("errorMessage") or ""
-        if _is_session_expired() or str(error_code) in ("401", "403", "110"):
+        if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,
@@ -720,7 +805,7 @@ async def play_catchup(
 
     if not stream_url or not stream_url.startswith("http"):
         error_code = data.get("code") or data.get("errorCode") or ""
-        if _is_session_expired() or str(error_code) in ("401", "403", "110"):
+        if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,

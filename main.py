@@ -160,6 +160,32 @@ async def send_telegram_alert(message: str):
         print(f"Failed to send Telegram alert: {e}")
 
 
+_last_otp_request_time = 0
+
+async def auto_request_otp():
+    """Automatically request an OTP if JIOTV_MOBILE is configured (rate-limited)."""
+    global _last_otp_request_time
+    if time.time() - _last_otp_request_time < 120:  # Only 1 auto-request per 2 minutes
+        return
+    
+    mobile = os.environ.get("JIOTV_MOBILE")
+    if not mobile:
+        return
+        
+    _last_otp_request_time = time.time()
+    await send_telegram_alert(f"🔄 <b>Auto-Login Triggered</b>\nRequesting OTP for {mobile}...")
+    encoded = base64.b64encode(("+91" + mobile).encode("ascii")).decode("ascii")
+    try:
+        if _http_client:
+            asyncio.create_task(_http_client.post(
+                "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/send",
+                json={"number": encoded},
+                headers=OTP_HEADERS,
+            ))
+    except Exception:
+        pass
+
+
 def _is_session_expired() -> bool:
     """Check if the ssotoken JWT is expired."""
     token = SESSION.get("ssotoken", "")
@@ -431,6 +457,70 @@ async def verify_otp(body: VerifyOtpReq):
     return {"status": "ok", "message": "Login successful"}
 
 
+@app.api_route("/api/webhook/otp", methods=["GET", "POST"])
+async def webhook_otp(request: Request):
+    """Receive forwarded SMS from Android, extract OTP, and verify."""
+    global SESSION
+    mobile = os.environ.get("JIOTV_MOBILE")
+    if not mobile:
+        return {"status": "error", "message": "JIOTV_MOBILE env var not set in Coolify"}
+
+    message = ""
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            message = body.get("message", "")
+        except:
+            pass
+    if not message:
+        message = request.query_params.get("message", "")
+        
+    if not message:
+        return {"status": "error", "message": "No message provided"}
+
+    import re
+    # JioTV sends: "123456 is your OTP to login..."
+    match = re.search(r'\b(\d{6})\b', message)
+    if not match:
+        return {"status": "error", "message": "No 6-digit OTP found in message"}
+    
+    otp = match.group(1)
+    
+    # Try verifying the extracted OTP
+    encoded = base64.b64encode(("+91" + mobile).encode("ascii")).decode("ascii")
+    payload = {
+        "number": encoded,
+        "otp": otp,
+        "deviceInfo": _device_info(),
+    }
+    
+    resp = await _http_client.post(
+        "https://jiotvapi.media.jio.com/userservice/apis/v1/loginotp/verify",
+        json=payload,
+        headers=OTP_HEADERS,
+    )
+    
+    data = resp.json()
+    if not data.get("ssoToken"):
+        await send_telegram_alert(f"❌ <b>Auto-Login Failed</b>\nFailed to verify OTP {otp}. It might be expired.")
+        return {"status": "error", "message": "OTP verification failed"}
+
+    SESSION = {
+        "ssotoken": data.get("ssoToken", ""),
+        "userid": data.get("sessionAttributes", {}).get("user", {}).get("uid", ""),
+        "uniqueid": data.get("sessionAttributes", {}).get("user", {}).get("unique", ""),
+        "crmid": data.get("sessionAttributes", {}).get("user", {}).get("subscriberId", ""),
+        "subscriberid": data.get("sessionAttributes", {}).get("user", {}).get("subscriberId", ""),
+        "authtoken": data.get("authToken", ""),
+        "jtoken": data.get("jToken", ""),
+        "deviceid": data.get("deviceId", ""),
+    }
+    _save_session()
+    
+    await send_telegram_alert(f"✅ <b>Auto-Login Successful!</b>\nNew session generated using OTP from your phone SMS Webhook.")
+    return {"status": "ok", "message": "Auto-login successful"}
+
+
 @app.post("/api/logout")
 async def logout():
     """Clear session and delete session.json"""
@@ -672,6 +762,7 @@ async def play_channel(channel_id: str, request: Request):
         if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
             request_base = _get_request_base(request) if request else ""
             await send_telegram_alert(f"⚠️ <b>JioTV Session Expired!</b>\nAPI returned error code: {error_code}\nPlease log in again at: {request_base}/login")
+            asyncio.create_task(auto_request_otp())
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,
@@ -836,6 +927,7 @@ async def play_catchup(
         if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
             request_base = _get_request_base(request) if request else ""
             await send_telegram_alert(f"⚠️ <b>JioTV Session Expired!</b>\nAPI returned error code: {error_code}\nPlease log in again at: {request_base}/login")
+            asyncio.create_task(auto_request_otp())
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,

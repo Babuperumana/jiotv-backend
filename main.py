@@ -134,6 +134,32 @@ def _device_info() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+_last_alert_time = 0
+
+async def send_telegram_alert(message: str):
+    global _last_alert_time
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        return
+    # Rate limit: max 1 alert every 10 minutes (600 seconds)
+    if time.time() - _last_alert_time < 600:
+        return
+    _last_alert_time = time.time()
+    
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        if _http_client:
+            # Send in background so we don't block the request
+            asyncio.create_task(_http_client.post(url, json=payload, timeout=5.0))
+    except Exception as e:
+        print(f"Failed to send Telegram alert: {e}")
+
+
 def _is_session_expired() -> bool:
     """Check if the ssotoken JWT is expired."""
     token = SESSION.get("ssotoken", "")
@@ -644,6 +670,8 @@ async def play_channel(channel_id: str, request: Request):
         error_code = data.get("code") or data.get("errorCode") or ""
         error_msg = data.get("message") or data.get("errorMessage") or ""
         if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
+            request_base = _get_request_base(request) if request else ""
+            await send_telegram_alert(f"⚠️ <b>JioTV Session Expired!</b>\nAPI returned error code: {error_code}\nPlease log in again at: {request_base}/login")
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,
@@ -806,6 +834,8 @@ async def play_catchup(
     if not stream_url or not stream_url.startswith("http"):
         error_code = data.get("code") or data.get("errorCode") or ""
         if _is_session_expired() or str(error_code) in ("401", "403", "110", "419"):
+            request_base = _get_request_base(request) if request else ""
+            await send_telegram_alert(f"⚠️ <b>JioTV Session Expired!</b>\nAPI returned error code: {error_code}\nPlease log in again at: {request_base}/login")
             raise HTTPException(status_code=401, detail={
                 "message": "Session expired, please re-login",
                 "api_response": data,
